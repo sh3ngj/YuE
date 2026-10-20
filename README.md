@@ -139,6 +139,8 @@ with YuE2Pipeline.from_pretrained("m-a-p/YuE2-3B", device="cuda") as pipe:
 | `cot="off"` | Generate directly from lyrics and style |
 | `abc=...` | Supply your own score in `full` or `melody` mode |
 
+**Apple Silicon.** Install `python -m pip install '.[mlx]'` and pass `backend="mlx"` (CLI: `--backend mlx`). The network runs in MLX with the same BF16 preset; token sampling, acoustic noise, and the VAE decoder are unchanged. This backend is outside the validated CUDA baseline. On an M5 Pro, a 95-second song took 73 seconds end to end.
+
 [Generation guide](docs/generation.md) · [Original example inputs](examples/README.md) · [v0.1.6 wheel archive](https://github.com/multimodal-art-projection/YuE/releases/download/yue2-v0.1.6/yue2_infer-0.1.6-py3-none-any.whl)
 
 ## Cover a song

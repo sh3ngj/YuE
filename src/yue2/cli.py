@@ -67,13 +67,17 @@ def doctor(args):
             versions[package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
             versions[package] = None
+    try:
+        mlx_version = importlib.metadata.version("mlx")
+    except importlib.metadata.PackageNotFoundError:
+        mlx_version = None
     devices = []
     for i in range(torch.cuda.device_count()):
         p = torch.cuda.get_device_properties(i)
         devices.append({"id": i, "name": p.name, "memory_gib": p.total_memory / 2**30,
                         "compute_capability": [p.major, p.minor]})
     report = {"dependencies_ready": all(versions.values()), "versions": versions,
-              "cuda": devices, "mps_available": torch.backends.mps.is_available(),
+              "cuda": devices, "mps_available": torch.backends.mps.is_available(), "mlx": mlx_version,
               "model": model, "vae": vae, "default_cot": "full", "default_cfg": {"full": 1., "melody": 1., "off": 1.01},
               "validated": False, "note": "Environment readiness is not quality or real-24GB acceptance."}
     if args.verify_hashes:
@@ -194,7 +198,7 @@ def parser():
         q.add_argument("--vae-revision")
         q.add_argument("--device", default="auto")
         q.add_argument("--budget", type=float, default=24)
-        q.add_argument("--backend", choices=("torch", "torch-eager", "vllm"), default="torch")
+        q.add_argument("--backend", choices=("torch", "torch-eager", "vllm", "mlx"), default="torch")
         q.add_argument("--quantization", choices=("none", "fp8"), default="none")
         q.add_argument("--offload-ar", action="store_true")
         q.add_argument("--offline", action="store_true")

@@ -125,10 +125,17 @@ class YuE2Pipeline:
         if not isinstance(progress, bool):
             raise TypeError("progress must be True or False")
         self.progress = progress
-        if backend not in {"torch", "torch-eager", "vllm"}:
-            raise ValueError("backend must be torch, torch-eager, or vllm")
+        if backend not in {"torch", "torch-eager", "vllm", "mlx"}:
+            raise ValueError("backend must be torch, torch-eager, vllm, or mlx")
         if quantization not in {"none", "fp8"}:
             raise ValueError("quantization must be none or fp8")
+        if backend == "mlx":
+            import importlib.util
+            if importlib.util.find_spec("mlx") is None:
+                raise ImportError("Install the optional Apple Silicon backend with pip install 'yue2-infer[mlx]'")
+            if quantization != "none" or offload_ar:
+                raise ValueError("The MLX backend runs the unquantized preset in unified memory; "
+                                 "fp8 and offload_ar are CUDA options")
         if not 0 < memory_budget_gib:
             raise ValueError("memory_budget_gib must be positive")
         if device == "auto":
@@ -153,7 +160,7 @@ class YuE2Pipeline:
             self.weights = {"mot": model_identity(self.model_dir, verify_hashes),
                             "vae": model_identity(self.vae_dir, verify_hashes)}
         self.runtime_sha256 = identity({p.name: sha256_file(p) for p in sorted(Path(__file__).parent.glob("*.py"))})
-        self._model, self._vae = None, None
+        self._model, self._vae, self._mlx = None, None, None
         self.load_timing = {}
         if self.device.type == "cuda":
             if not torch.cuda.is_bf16_supported():
@@ -222,6 +229,15 @@ class YuE2Pipeline:
             self._model.to(self.device)
         return self._model
 
+    def _load_mlx(self):
+        if self._mlx is None:
+            from .mlx_backend import load
+            with self._status("Loading model"):
+                start = time.perf_counter()
+                self._mlx = load(self.model_dir)
+                self.load_timing["mlx_load_seconds"] = time.perf_counter() - start
+        return self._mlx
+
     def _request(self, style=None, lyrics=None, *, tags=None, **kwargs):
         if style is not None and tags is not None and style != tags:
             raise ValueError("style and tags are aliases and cannot disagree")
@@ -231,7 +247,8 @@ class YuE2Pipeline:
         return SongRequest(style=style, lyrics=lyrics, **kwargs)
 
     def _generate(self, prefix, sampling, seed, phase, **kwargs):
-        model = self._load_model() if self.backend != "vllm" else None
+        model = (self._load_mlx() if self.backend == "mlx" else
+                 self._load_model() if self.backend != "vllm" else None)
         callback = kwargs.pop("on_token", None)
         label = "Planning score" if phase == "abc" else "Generating song"
         with self._status(label, unit="tokens") as status:
@@ -245,6 +262,9 @@ class YuE2Pipeline:
             if self.backend == "vllm":
                 from .fast import generate_vllm
                 result = generate_vllm(self, prefix, sampling, seed, phase, on_token=observed, **kwargs)
+            elif self.backend == "mlx":
+                from .mlx_backend import generate_tokens as generate_mlx
+                result = generate_mlx(model, prefix, sampling, seed, phase, on_token=observed, **kwargs)
             else:
                 result = generate_tokens(model, prefix, sampling, seed, phase,
                                          use_cuda_graph=self.backend != "torch-eager", on_token=observed, **kwargs)
@@ -283,7 +303,6 @@ class YuE2Pipeline:
         return SemanticResult(plan, [int(t) - CODEC_OFFSET for t in ids], timing, truncated)
 
     def synthesize(self, semantic, *, cancelled=None):
-        from .nar import synthesize
         if self.backend == "vllm":
             from .fast import close_vllm
             close_vllm(self)
@@ -291,22 +310,31 @@ class YuE2Pipeline:
             raise TypeError("Pass the SemanticResult returned by generate_semantic()")
         if token_prefixes(semantic.plan.request, self.tokenizer, semantic.plan.abc_ids) != semantic.plan.prefix:
             raise ValueError("Semantic result does not retain the request's exact prefix")
-        if self.quantization != "none":
-            from .quantization import restore_ar
-            restore_ar(self._model)
-        model = self._load_model(for_nar=True)
+        if self.backend == "mlx":
+            from .mlx_backend import synthesize
+            model, options = self._load_mlx(), {}
+        else:
+            from .nar import synthesize
+            if self.quantization != "none":
+                from .quantization import restore_ar
+                restore_ar(self._model)
+            model, options = self._load_model(for_nar=True), {"offload_ar": self.offload_ar}
         with self._status("Synthesizing audio", unit="steps") as status:
             report = (lambda completed, total: status.update(completed, total=total)) if self.progress else None
             result = synthesize(model, semantic.plan.prefix, semantic.tokens,
                                 semantic.plan.request.seed, steps=self.generation_config.ode_steps,
-                                context=self.generation_config.context, offload_ar=self.offload_ar,
-                                cancelled=cancelled, on_progress=report)
+                                context=self.generation_config.context, cancelled=cancelled,
+                                on_progress=report, **options)
             return result.detach().float().cpu().numpy()
 
     def close(self):
         if self.backend == "vllm":
             from .fast import close_vllm
             close_vllm(self)
+        if self._mlx is not None:
+            import mlx.core as mx
+            self._mlx = None
+            mx.clear_cache()
         self._model, self._vae = None, None
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
