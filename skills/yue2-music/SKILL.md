@@ -59,6 +59,9 @@ Model weights and third-party dependencies retain their applicable licenses.
 Use the supported baseline: one request at a time, BF16-capable NVIDIA GPU with 24 GB
 VRAM, default YuE2 settings. Do not silently shorten a requested song or lower inference
 settings to hide an OOM. Free allocations or choose suitable hardware; report changes.
+The instrumental helper's `--device auto` also selects Apple Silicon MPS with the same
+preset, and its `--backend auto` runs the network in MLX when the installed runtime
+provides `yue2.mlx_backend`; report such runs as outside this validated baseline.
 
 Use `YuE2-Vae` for listening and `YuE2-Vae-legacy` when reproducing the supplied benchmark
 protocol. Keep decoded files separate. Do not infer their roles from the word “legacy.”

@@ -4,6 +4,10 @@
   "package_version": "0.1.5",
   "wheel_url": "https://huggingface.co/m-a-p/YuE2-3B/resolve/14fc6c6f146441b1dd6363fcb2e01e82a6914cb7/yue2_infer-0.1.5-py3-none-any.whl",
   "wheel_sha256": "8801e2c0d969db02df78d2994150b4ccd86077d87c24fdb8509b1f6f31462641",
+  "mlx": {
+    "version": "0.32.1",
+    "runtime": "yue2-infer repository source providing yue2.mlx_backend, installed with its [mlx] extra"
+  },
   "models": {
     "YuE2-3B": {
       "repo": "m-a-p/YuE2-3B",

@@ -16,7 +16,7 @@
 
 ## 首次使用
 
-需要 Linux、Python 3.10+ 和支持 BF16 的 NVIDIA 24 GB 级 GPU。模型文件约 7.8 GB，依赖另占空间。没有 GPU 时可以先修复和校验已有曲谱；默认的模型写谱、音频转谱和声音生成需要 GPU。
+需要 Linux、Python 3.10+ 和支持 BF16 的 NVIDIA 24 GB 级 GPU；Apple Silicon Mac 可通过 MPS 运行，安装 MLX 运行时后自动改用更快的 MLX；两者都不属于已验证基线。模型文件约 7.8 GB，依赖另占空间。没有 GPU 时可以先修复和校验已有曲谱；默认的模型写谱、音频转谱和声音生成需要 GPU。
 
 将本文件夹放到 agent 支持的 skill 目录即可安装；也可以直接让 agent 读取 `SKILL.md`。环境准备细节见 [安装与迁移](references/setup.md)，交给 agent 执行即可。
 

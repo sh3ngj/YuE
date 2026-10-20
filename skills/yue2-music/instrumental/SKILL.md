@@ -53,4 +53,6 @@ description: 用 YuE2 生成纯音乐或制作纯音乐 cover。默认由 YuE2 �
 
 试听用 **m-a-p/YuE2-Vae**；保持默认采样、BF16 AR/NAR、FP32 VAE 和 32 步，每张 GPU 顺序运行。环境不足时解决资源问题，不暗中改歌长或降设置。
 
+`--device` 默认 `auto`：先选 CUDA，再选 Apple Silicon MPS。`--backend` 默认 `auto`：Apple Silicon 上若运行时提供 MLX 后端，网络在 MLX 中运行，否则用 torch。MPS 和 MLX 使用同一预设，但都不属于已验证的 CUDA 基线；MLX 运行时来自仓库源码，不是固定 wheel。`summary.json` 记录实际设备、`backend`、`package_version` 和 `runtime_patches`，交付时说明。
+
 发布 skill 只用核验后的发布包。`listen/` 不带原始会话、机器配置和日志，但仍包含用户作品与 prompt，只交给本人或授权对象。见 [分发与隐私](PRIVACY.md)。

@@ -515,6 +515,47 @@ class ComposerRoutingTests(unittest.TestCase):
         self.assertEqual(json.loads((out/'workflow.json').read_text())['score_origin'],'SheetSage2 transcription')
         self.assertEqual(json.loads((out/'conversion/transfer.json').read_text())['vocal_notes_before'],3)
 
+    def test_backend_choice_reaches_generation(self):
+        with patch.object(instrumental,'generate',return_value=2) as generate:
+            self.assertEqual(self.call('run','--abc',self.source,'--backend','mlx','--output',self.root/'mlx'),2)
+            self.assertEqual(self.call('run','--abc',self.source,'--output',self.root/'auto'),2)
+        self.assertEqual([call.args[0].backend for call in generate.call_args_list],['mlx','auto'])
+        with patch('sys.stderr'), self.assertRaises(SystemExit):
+            self.call('run','--abc',self.source,'--backend','metal','--output',self.root/'bad')
+        self.assertFalse((self.root/'bad').exists())
+
+
+class BackendTests(unittest.TestCase):
+    def test_auto_uses_mlx_only_on_apple_silicon_with_an_mlx_runtime(self):
+        import setup_runtime
+        with patch.object(setup_runtime,'mlx_runtime',return_value=True):
+            self.assertEqual(setup_runtime.resolve_backend('auto','mps'),'mlx')
+            self.assertEqual(setup_runtime.resolve_backend('auto','cuda:0'),'torch')
+            self.assertEqual(setup_runtime.resolve_backend('torch','mps'),'torch')
+        with patch.object(setup_runtime,'mlx_runtime',return_value=False):
+            self.assertEqual(setup_runtime.resolve_backend('auto','mps'),'torch')
+            self.assertEqual(setup_runtime.resolve_backend('mlx','mps'),'mlx')
+        with self.assertRaises(ValueError):
+            setup_runtime.resolve_backend('metal','mps')
+
+    def test_runtime_pins_depend_on_backend(self):
+        import setup_runtime
+        release=json.loads((ROOT/'assets/release.json').read_text(encoding='utf-8'))
+        versions={'yue2-infer':'0.1.6','mlx':release['mlx']['version']}
+        with patch.object(setup_runtime.importlib.metadata,'version',side_effect=versions.__getitem__):
+            with self.assertRaisesRegex(ValueError,'pinned yue2-infer'):
+                setup_runtime.check_runtime(release,'torch')
+            with patch.object(setup_runtime,'mlx_runtime',return_value=False), self.assertRaises(ImportError):
+                setup_runtime.check_runtime(release,'mlx')
+            with patch.object(setup_runtime,'mlx_runtime',return_value=True):
+                setup_runtime.check_runtime(release,'mlx')
+                versions['mlx']='0.0.1'
+                with self.assertRaisesRegex(ValueError,'mlx'):
+                    setup_runtime.check_runtime(release,'mlx')
+        versions.update({'yue2-infer':release['package_version']})
+        with patch.object(setup_runtime.importlib.metadata,'version',side_effect=versions.__getitem__):
+            setup_runtime.check_runtime(release,'torch')
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

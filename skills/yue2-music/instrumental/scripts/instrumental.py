@@ -178,20 +178,58 @@ def write_player(out, request, summary, audio_name, shared=False):
     (out / 'index.html').write_text(content, encoding='utf-8')
 
 
+def patch_mps_decode_attention():
+    """Give the pinned runtime the upstream MPS decode fix.
+
+    PyTorch 2.10's maskless MPS kernel for one decode query returns wrong outputs once
+    1024 or more keys are cached; an explicit all-visible mask selects a correct kernel.
+    """
+    import torch
+    from yue2 import modeling_yue2
+    original = modeling_yue2.sdpa
+    if getattr(original, 'mps_decode_mask', False):
+        return
+
+    def sdpa(query, key, value, *, attn_mask=None, is_causal=False):
+        if attn_mask is None and not is_causal and query.shape[2] == 1:
+            attn_mask = torch.ones(1, 1, 1, key.shape[2], dtype=torch.bool, device=query.device)
+        return original(query, key, value, attn_mask=attn_mask, is_causal=is_causal)
+
+    sdpa.mps_decode_mask = True
+    modeling_yue2.sdpa = sdpa
+
+
+def runtime_patches(pipe):
+    return ['mps_decode_mask'] if pipe.device.type == 'mps' and pipe.backend == 'torch' else []
+
+
 def open_pipeline(args):
     release = read_json(ROOT / 'assets/release.json')
-    version = importlib.metadata.version('yue2-infer')
-    if version != release['package_version']:
-        raise ValueError(f"Use the pinned yue2-infer {release['package_version']}; run setup_runtime.py install")
     import torch
+    from setup_runtime import check_runtime, mps_bf16, resolve_backend, resolve_device
+    name = resolve_device(args.device)
+    if name is None:
+        raise RuntimeError('No CUDA or Apple Silicon GPU; run this command inside a GPU allocation, keeping CPU preparation intact')
+    device = torch.device(name)
+    backend = resolve_backend(args.backend, name)
+    check_runtime(release, backend)
     from yue2 import YuE2Pipeline
-    if not torch.cuda.is_available():
-        raise RuntimeError('No CUDA device; run this command inside a GPU allocation, keeping CPU preparation intact')
-    device = torch.device(args.device)
-    if device.type != 'cuda':
-        raise ValueError('This recipe requires a BF16-capable NVIDIA GPU')
-    if torch.cuda.get_device_capability(device)[0] < 8:
-        raise RuntimeError('This recipe requires a BF16-capable GPU (compute capability >= 8)')
+    if device.type == 'cuda':
+        if backend == 'mlx':
+            raise ValueError('The MLX backend requires Apple Silicon')
+        if not torch.cuda.is_available():
+            raise RuntimeError('No CUDA device; run this command inside a GPU allocation, keeping CPU preparation intact')
+        if torch.cuda.get_device_capability(device)[0] < 8:
+            raise RuntimeError('This recipe requires a BF16-capable GPU (compute capability >= 8)')
+    elif device.type == 'mps':
+        # Apple Silicon runs the same BF16 AR/NAR and FP32 VAE preset outside the supported CUDA baseline;
+        # with MLX only the network moves to MLX and the VAE stays on MPS.
+        if not torch.backends.mps.is_available() or not mps_bf16():
+            raise RuntimeError('Apple Silicon MPS with BF16 support is unavailable in this PyTorch build')
+        if backend == 'torch':
+            patch_mps_decode_attention()
+    else:
+        raise ValueError('This recipe requires a BF16-capable NVIDIA GPU or Apple Silicon MPS')
     model_spec, vae_spec = release['models']['YuE2-3B'], release['models']['YuE2-Vae']
     if args.models_root:
         model, vae = args.models_root / 'YuE2-3B', args.models_root / 'YuE2-Vae'
@@ -200,7 +238,7 @@ def open_pipeline(args):
     else:
         model, vae = model_spec['repo'], vae_spec['repo']
     torch.set_num_threads(8)
-    pipe = YuE2Pipeline.from_pretrained(model, vae=vae, device=args.device,
+    pipe = YuE2Pipeline.from_pretrained(model, vae=vae, device=name, backend=backend,
         revision=model_spec['revision'], vae_revision=vae_spec['revision'],
         local_files_only=args.offline, memory_budget_gib=24)
     try:
@@ -220,7 +258,7 @@ def generate(args):
     request = load_prepared(args.prepared)
     version = importlib.metadata.version('yue2-infer')
     import numpy as np
-    import torch
+    from setup_runtime import device_name
     from yue2.protocol import SongRequest, token_prefixes
     from yue2.storage import verify_result
     req = SongRequest(**request)
@@ -239,6 +277,8 @@ def generate(args):
             if len(pipe.tokenizer.encode(request['abc'])) > 4096:
                 raise ValueError('ABC exceeds the normal 4096-token planning budget; compact notation without dropping music')
             expected_prefix = token_prefixes(req, pipe.tokenizer)
+            device, gpu, backend = str(pipe.device), device_name(pipe.device), pipe.backend
+            patches = runtime_patches(pipe)
             song = pipe(**request)
             song.save_artifacts(out / 'native')
         receipt = verify_result(out / 'native')
@@ -252,7 +292,7 @@ def generate(args):
         summary = dict(status=status, audio_seconds=receipt['audio_seconds'], sample_rate=48000,
             truncated=receipt['truncated'], exact_prefix_verified=True, exact_abc_verified=True,
             seed=request['seed'], cot=request['cot'], package_version=version,
-            gpu=torch.cuda.get_device_name(args.device), peak=float(np.max(np.abs(song.audio))),
+            device=device, gpu=gpu, backend=backend, runtime_patches=patches, peak=float(np.max(np.abs(song.audio))),
             rms=float(np.sqrt(np.mean(song.audio.astype(np.float64) ** 2))),
             decoder='m-a-p/YuE2-Vae (listening)', weights=receipt['weights'],
             audio_adherence_checked=False, absence_of_vocals_checked=False)
@@ -352,10 +392,11 @@ def plan_with_model(args, destination):
     (out / 'prompt.txt').write_text(request.text(), encoding='utf-8')
     try:
         with open_pipeline(args) as pipe:
+            patches = runtime_patches(pipe)
             plan = pipe.plan(request=request)
             plan.save(out)
             write_json(out / 'provenance.json', {'composer': 'YuE2', 'weights': pipe.weights,
-                'config': pipe.effective_config(request)})
+                'config': pipe.effective_config(request), 'backend': pipe.backend, 'runtime_patches': patches})
         restored = SymbolicPlan.load(out)
         if restored.truncated or not restored.abc:
             raise ValueError('Model score is empty or truncated; keep the failed plan and retry explicitly')
@@ -371,9 +412,13 @@ def transcribe_cover(args, destination):
         raise ValueError('Audio cover needs --transcriber-python from a separate SheetSage2 environment')
     if not args.audio.is_file():
         raise FileNotFoundError(args.audio)
+    from setup_runtime import resolve_device
+    device = resolve_device(args.device)
+    if device is None:
+        raise RuntimeError('No CUDA or Apple Silicon GPU for transcription; run inside a GPU allocation')
     command = [str(args.transcriber_python), str(ROOT / 'scripts/transcribe_cover.py'), str(args.audio),
         '--output', str(destination), '--task', 'full' if args.keep_harmony else 'melody-full',
-        '--device', args.device]
+        '--device', device]
     if args.transcriber_model:
         command += ['--model', args.transcriber_model]
     if args.transcriber_revision:
@@ -435,7 +480,7 @@ def run(args):
         return 0
     generation = args.output / 'generation'
     result = generate(Namespace(prepared=prepared, output=generation,
-        models_root=args.models_root, offline=args.offline, device=args.device))
+        models_root=args.models_root, offline=args.offline, device=args.device, backend=args.backend))
     if result:
         return result
     return share(Namespace(directory=generation, output=args.output / 'listen'))
@@ -460,7 +505,9 @@ def add_score_arguments(p, required=True):
 
 def add_runtime_arguments(p):
     p.add_argument('--models-root', type=Path)
-    p.add_argument('--device', default='cuda:0')
+    p.add_argument('--device', default='auto', help="'auto' tries CUDA, then Apple Silicon MPS")
+    p.add_argument('--backend', default='auto', choices=('auto', 'torch', 'mlx'),
+                   help="'auto' runs the network in MLX on Apple Silicon when the runtime provides it")
     p.add_argument('--offline', action='store_true')
 
 
