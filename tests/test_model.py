@@ -10,6 +10,7 @@ import torch
 from transformers import AutoModelForCausalLM
 from transformers.cache_utils import DynamicCache, StaticCache
 
+from yue2 import modeling_yue2
 from yue2.modeling_yue2 import YuE2Config, YuE2ForCausalLM, StaticKVCache
 
 
@@ -137,6 +138,24 @@ def test_training_labels_and_causality(model):
     assert torch.isfinite(model(first, labels=first).loss)
     with pytest.raises(ValueError, match="Loss"):
         model(first, labels=first, logits_to_keep=1)
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="Apple Silicon MPS is unavailable")
+def test_mps_decode_query_uses_explicit_mask(monkeypatch):
+    # PyTorch 2.10's maskless one-query MPS kernel is wrong with >= 1024 cached keys.
+    seen = []
+
+    def record(query, key, value, attn_mask=None, is_causal=False, enable_gqa=False):
+        seen.append((attn_mask, is_causal))
+        return query
+
+    monkeypatch.setattr(modeling_yue2.F, "scaled_dot_product_attention", record)
+    key = torch.zeros(1, 2, 1024, 8, device="mps")
+    modeling_yue2.sdpa(torch.zeros(1, 4, 1, 8, device="mps"), key, key)
+    modeling_yue2.sdpa(torch.zeros(1, 4, 3, 8, device="mps"), key[:, :, :3], key[:, :, :3], is_causal=True)
+    (mask, causal), (prefill_mask, prefill_causal) = seen
+    assert mask.dtype == torch.bool and mask.shape == (1, 1, 1, 1024) and bool(mask.all()) and not causal
+    assert prefill_mask is None and prefill_causal
 
 
 def test_release_tensor_names_and_shapes_when_source_available():

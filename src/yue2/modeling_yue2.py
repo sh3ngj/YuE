@@ -19,6 +19,11 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 def sdpa(query, key, value, *, attn_mask=None, is_causal=False):
     """Use native grouped-query attention, including a portable MPS fallback."""
+    if query.device.type == "mps" and attn_mask is None and not is_causal and query.shape[2] == 1:
+        # PyTorch 2.10's maskless MPS kernel for one decode query returns wrong
+        # outputs once 1024 or more keys are cached; an explicit all-visible
+        # mask selects a correct kernel.
+        attn_mask = torch.ones(1, 1, 1, key.shape[2], dtype=torch.bool, device=query.device)
     grouped = query.shape[1] != key.shape[1]
     if grouped and query.device.type == "mps":
         # PyTorch's MPS attention does not implement enable_gqa on every release.
