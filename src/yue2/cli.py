@@ -32,7 +32,8 @@ def get_pipe(args):
     return YuE2Pipeline.from_pretrained(model, vae=vae, revision=args.revision,
              vae_revision=args.vae_revision, device=args.device, memory_budget_gib=args.budget,
              backend=args.backend, quantization=args.quantization, offload_ar=args.offload_ar,
-             local_files_only=args.offline, generation_config=config,
+             local_files_only=args.offline, generation_config=config, mlx_sampler=args.mlx_sampler,
+             vae_backend=args.vae_backend,
              vae_core_frames=512 if args.budget <= 12 else 1024,
              progress=not getattr(args, "quiet", False))
 
@@ -67,13 +68,17 @@ def doctor(args):
             versions[package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
             versions[package] = None
+    try:
+        mlx_version = importlib.metadata.version("mlx")
+    except importlib.metadata.PackageNotFoundError:
+        mlx_version = None
     devices = []
     for i in range(torch.cuda.device_count()):
         p = torch.cuda.get_device_properties(i)
         devices.append({"id": i, "name": p.name, "memory_gib": p.total_memory / 2**30,
                         "compute_capability": [p.major, p.minor]})
     report = {"dependencies_ready": all(versions.values()), "versions": versions,
-              "cuda": devices, "mps_available": torch.backends.mps.is_available(),
+              "cuda": devices, "mps_available": torch.backends.mps.is_available(), "mlx": mlx_version,
               "model": model, "vae": vae, "default_cot": "full", "default_cfg": {"full": 1., "melody": 1., "off": 1.01},
               "validated": False, "note": "Environment readiness is not quality or real-24GB acceptance."}
     if args.verify_hashes:
@@ -194,7 +199,11 @@ def parser():
         q.add_argument("--vae-revision")
         q.add_argument("--device", default="auto")
         q.add_argument("--budget", type=float, default=24)
-        q.add_argument("--backend", choices=("torch", "torch-eager", "vllm"), default="torch")
+        q.add_argument("--backend", choices=("torch", "torch-eager", "vllm", "mlx"), default="torch")
+        q.add_argument("--mlx-sampler", choices=("device", "torch"), default="device",
+                       help="MLX only: sample in MLX, or keep the torch RNG's draws")
+        q.add_argument("--vae-backend", choices=("torch", "mlx"),
+                       help="Audio decoder; defaults to mlx with --backend mlx, otherwise torch")
         q.add_argument("--quantization", choices=("none", "fp8"), default="none")
         q.add_argument("--offload-ar", action="store_true")
         q.add_argument("--offline", action="store_true")

@@ -53,6 +53,20 @@ def test_query_tiling_preserves_all_keys_and_gqa(causal):
     torch.testing.assert_close(result, expected, atol=4e-7, rtol=4e-6)
 
 
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="Apple Silicon MPS is unavailable")
+@pytest.mark.parametrize("causal", [False, True])
+def test_mps_final_short_query_block_matches_cpu(causal):
+    # A final 1-8-row block over > 1023 keys hits PyTorch 2.10's corrupting MPS vector kernel.
+    # Only the maskless (acoustic) case reproduced it here; the causal case checks mask padding.
+    generator = torch.Generator().manual_seed(29)
+    for rows in range(1, 9):
+        q = torch.randn((1024 if causal else 256) + rows, 16, 128, generator=generator)
+        k, v = (torch.randn(len(q) if causal else 1500, 8, 128, generator=generator) for _ in range(2))
+        expected = nar.attention(q, k, v, causal=causal)[-rows:]
+        actual = nar.attention(*(t.to("mps", torch.bfloat16) for t in (q, k, v)), causal=causal)[-rows:]
+        assert (actual.float().cpu() - expected).abs().max() < 0.05 * expected.abs().max(), rows
+
+
 def test_noise_is_one_cpu_float32_draw_before_original_chunks():
     state = torch.random.get_rng_state().clone()
     chunks = nar.song_chunks([2, 3], list(range(11)), 812, context=15)

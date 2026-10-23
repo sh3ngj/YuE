@@ -121,14 +121,30 @@ class SongResult:
 class YuE2Pipeline:
     def __init__(self, model_dir, vae_dir, *, device="auto", memory_budget_gib=24,
                  backend="torch", generation_config=None, verify_hashes=True,
-                 vae_core_frames=None, quantization="none", offload_ar=False, progress=True):
+                 vae_core_frames=None, quantization="none", offload_ar=False, progress=True,
+                 mlx_sampler="device", vae_backend=None):
         if not isinstance(progress, bool):
             raise TypeError("progress must be True or False")
         self.progress = progress
-        if backend not in {"torch", "torch-eager", "vllm"}:
-            raise ValueError("backend must be torch, torch-eager, or vllm")
+        if backend not in {"torch", "torch-eager", "vllm", "mlx"}:
+            raise ValueError("backend must be torch, torch-eager, vllm, or mlx")
         if quantization not in {"none", "fp8"}:
             raise ValueError("quantization must be none or fp8")
+        vae_backend = vae_backend or ("mlx" if backend == "mlx" else "torch")
+        if vae_backend not in {"torch", "mlx"}:
+            raise ValueError("vae_backend must be torch or mlx")
+        if "mlx" in {backend, vae_backend}:
+            import importlib.util
+            if importlib.util.find_spec("mlx") is None:
+                raise ImportError("The MLX backend needs this runtime's [mlx] extra; from the YuE source tree, "
+                                  "run uv pip install '.[mlx]'")
+        if backend == "mlx" and (quantization != "none" or offload_ar):
+            raise ValueError("The MLX backend runs the unquantized preset in unified memory; "
+                             "fp8 and offload_ar are CUDA options")
+        if mlx_sampler not in {"device", "torch"}:
+            raise ValueError("mlx_sampler must be device or torch")
+        # MLX only: "device" samples in MLX; "torch" keeps the torch RNG's draws.
+        self.mlx_sampler, self.vae_backend = mlx_sampler, vae_backend
         if not 0 < memory_budget_gib:
             raise ValueError("memory_budget_gib must be positive")
         if device == "auto":
@@ -153,7 +169,7 @@ class YuE2Pipeline:
             self.weights = {"mot": model_identity(self.model_dir, verify_hashes),
                             "vae": model_identity(self.vae_dir, verify_hashes)}
         self.runtime_sha256 = identity({p.name: sha256_file(p) for p in sorted(Path(__file__).parent.glob("*.py"))})
-        self._model, self._vae = None, None
+        self._model, self._vae, self._mlx, self._mlx_vae = None, None, None, None
         self.load_timing = {}
         if self.device.type == "cuda":
             if not torch.cuda.is_bf16_supported():
@@ -222,6 +238,15 @@ class YuE2Pipeline:
             self._model.to(self.device)
         return self._model
 
+    def _load_mlx(self):
+        if self._mlx is None:
+            from .mlx_backend import load
+            with self._status("Loading model"):
+                start = time.perf_counter()
+                self._mlx = load(self.model_dir)
+                self.load_timing["mlx_load_seconds"] = time.perf_counter() - start
+        return self._mlx
+
     def _request(self, style=None, lyrics=None, *, tags=None, **kwargs):
         if style is not None and tags is not None and style != tags:
             raise ValueError("style and tags are aliases and cannot disagree")
@@ -231,7 +256,8 @@ class YuE2Pipeline:
         return SongRequest(style=style, lyrics=lyrics, **kwargs)
 
     def _generate(self, prefix, sampling, seed, phase, **kwargs):
-        model = self._load_model() if self.backend != "vllm" else None
+        model = (self._load_mlx() if self.backend == "mlx" else
+                 self._load_model() if self.backend != "vllm" else None)
         callback = kwargs.pop("on_token", None)
         label = "Planning score" if phase == "abc" else "Generating song"
         with self._status(label, unit="tokens") as status:
@@ -245,6 +271,10 @@ class YuE2Pipeline:
             if self.backend == "vllm":
                 from .fast import generate_vllm
                 result = generate_vllm(self, prefix, sampling, seed, phase, on_token=observed, **kwargs)
+            elif self.backend == "mlx":
+                from .mlx_backend import generate_tokens as generate_mlx
+                result = generate_mlx(model, prefix, sampling, seed, phase, on_token=observed,
+                                      sampler=self.mlx_sampler, **kwargs)
             else:
                 result = generate_tokens(model, prefix, sampling, seed, phase,
                                          use_cuda_graph=self.backend != "torch-eager", on_token=observed, **kwargs)
@@ -283,7 +313,6 @@ class YuE2Pipeline:
         return SemanticResult(plan, [int(t) - CODEC_OFFSET for t in ids], timing, truncated)
 
     def synthesize(self, semantic, *, cancelled=None):
-        from .nar import synthesize
         if self.backend == "vllm":
             from .fast import close_vllm
             close_vllm(self)
@@ -291,22 +320,31 @@ class YuE2Pipeline:
             raise TypeError("Pass the SemanticResult returned by generate_semantic()")
         if token_prefixes(semantic.plan.request, self.tokenizer, semantic.plan.abc_ids) != semantic.plan.prefix:
             raise ValueError("Semantic result does not retain the request's exact prefix")
-        if self.quantization != "none":
-            from .quantization import restore_ar
-            restore_ar(self._model)
-        model = self._load_model(for_nar=True)
+        if self.backend == "mlx":
+            from .mlx_backend import synthesize
+            model, options = self._load_mlx(), {}
+        else:
+            from .nar import synthesize
+            if self.quantization != "none":
+                from .quantization import restore_ar
+                restore_ar(self._model)
+            model, options = self._load_model(for_nar=True), {"offload_ar": self.offload_ar}
         with self._status("Synthesizing audio", unit="steps") as status:
             report = (lambda completed, total: status.update(completed, total=total)) if self.progress else None
             result = synthesize(model, semantic.plan.prefix, semantic.tokens,
                                 semantic.plan.request.seed, steps=self.generation_config.ode_steps,
-                                context=self.generation_config.context, offload_ar=self.offload_ar,
-                                cancelled=cancelled, on_progress=report)
+                                context=self.generation_config.context, cancelled=cancelled,
+                                on_progress=report, **options)
             return result.detach().float().cpu().numpy()
 
     def close(self):
         if self.backend == "vllm":
             from .fast import close_vllm
             close_vllm(self)
+        if self._mlx is not None or self._mlx_vae is not None:
+            import mlx.core as mx
+            self._mlx = self._mlx_vae = None
+            mx.clear_cache()
         self._model, self._vae = None, None
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
@@ -318,6 +356,8 @@ class YuE2Pipeline:
         self.close()
 
     def decode(self, latents, *, full=False, vae=None):
+        if self.vae_backend == "mlx":
+            return self._decode_mlx(latents, full=full, vae=vae)
         from .modeling_vae import YuE2VAE
         with self._status("Loading audio decoder"):
             if self._model is not None:
@@ -355,6 +395,36 @@ class YuE2Pipeline:
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
 
+    def _decode_mlx(self, latents, *, full, vae):
+        import mlx.core as mx
+        from .mlx_vae import MLXVAEDecoder
+        # Buffers cached from the network slowed the decoder's first large allocations
+        # (3.2 s vs 1.3 s for a 96 s song); decoding is the last stage, so release them.
+        mx.clear_cache()
+        with self._status("Loading audio decoder"):
+            if vae is not None:
+                model = MLXVAEDecoder.from_pretrained(vae)
+            else:
+                if self._mlx_vae is None:
+                    self._mlx_vae = MLXVAEDecoder(self.vae_dir)
+                model = self._mlx_vae
+        z = np.asarray(latents, dtype=np.float32)
+        if z.ndim == 3 and z.shape[:2] == (1, 64):
+            z = z[0].T
+        if z.ndim != 2 or z.shape[1] != 64:
+            raise ValueError("Expected latents [T,64] or [1,64,T]")
+        tiles = 1 if full else (len(z) + self.vae_core_frames - 1) // self.vae_core_frames
+        with self._status("Decoding audio", total=tiles, unit="chunks") as status:
+            report = (lambda completed, total: status.update(completed, total=total)) if self.progress else None
+            if full:
+                audio = model.decode(z)
+                status.update(1)
+            else:
+                audio = model.decode_tiled(z, core_frames=self.vae_core_frames, halo_frames=16, on_progress=report)
+        if not np.isfinite(audio).all():
+            raise ValueError("VAE produced non-finite audio")
+        return np.clip(audio, -1, 1)
+
     def effective_config(self, request, abc_sampling=None, semantic_sampling=None):
         config = self.generation_config.to_dict()
         for key, sampling in (("abc", abc_sampling), ("semantic", semantic_sampling)):
@@ -364,7 +434,7 @@ class YuE2Pipeline:
         overrides = {k: v for k, v in config.items() if defaults.get(k) != v}
         if request.guidance != (1.01 if request.cot == "off" else 1.0):
             overrides["cfg_scale"] = request.guidance
-        return {"generation": config, "overrides": overrides,
+        effective = {"generation": config, "overrides": overrides,
                 "cot": request.cot, "cfg_scale": request.guidance,
                 "cfg_negative": "instruction_only" if request.cot == "off" else "same_instruction_and_exact_abc",
                 "backend": self.backend, "quantization": self.quantization,
@@ -374,6 +444,12 @@ class YuE2Pipeline:
                 "offload_ar": self.offload_ar, "runtime_sha256": self.runtime_sha256,
                 "decoder_release": json.loads((self.vae_dir / "config.json").read_text(encoding="utf-8")).get("release_variant"),
                 "validation_status": "unvalidated"}
+        if self.backend == "mlx":
+            # Historical off sampling always keeps the torch sampler; see mlx_backend.generate_tokens.
+            effective["mlx_sampler"] = "torch" if request.cot == "off" else self.mlx_sampler
+        if self.backend == "mlx" or self.vae_backend != "torch":
+            effective["vae_backend"] = self.vae_backend
+        return effective
 
     def __call__(self, style=None, lyrics=None, *, tags=None, abc_sampling=None,
                  semantic_sampling=None, cancelled=None, on_token=None, **kwargs):

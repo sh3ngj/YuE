@@ -2,6 +2,10 @@
 
 修谱/准备工具：Python 3.10+ 标准库即可。推理：Linux、Python 3.10+（本包验证用 3.12）、支持 BF16 的 NVIDIA 24 GB 级 GPU，至少 24 GB 可用主机内存。FFmpeg 可选，用于导出方便播放的 MP3；没有时仍交付无损 FLAC。GPU 与驱动由集群提供。
 
+Apple Silicon（macOS、MPS）也可运行同一 wheel 和预设，但不属于已验证基线。doctor 要求 MPS 支持 BF16，且 Metal 建议工作集至少 20 GiB。PyTorch 2.10 的 MPS 注意力在查询不超过 8 行、key 超过 1023 个时，把 FP32 中间量写进 BF16 大小的临时缓冲区，结果和相邻内存会被不确定地破坏，加 mask 也一样（pytorch/pytorch#174945）。逐 token 解码（写谱和语义 token）和流匹配最后一个 1–8 行的查询块都会触发，表现为曲谱退化或潜变量非有限。脚本在 MPS 的 torch 后端上把短查询补到 9 行再丢弃多余输出（`mps_short_query_attention`），与运行时的 `mps_safe_attention` 一致，并写入 `runtime_patches`。
+
+MLX（可选，Apple Silicon 上更快）：固定 wheel 不含 MLX 后端。用 uv 在 skill 目录外另建环境，从 YuE 仓库源码安装运行时及其 `[mlx]` extra：`uv venv --python 3.12 ~/venvs/yue2-mlx`，`uv pip install --python ~/venvs/yue2-mlx/bin/python '/path/to/YuE[mlx]'`；MLX 版本固定在 `assets/release.json`。用 `uv run --no-project --python ~/venvs/yue2-mlx/bin/python scripts/setup_runtime.py doctor --backend mlx --require-gpu --models-root /path/to/models` 验证，之后用同一解释器运行 `scripts/instrumental.py run`，默认 `--backend auto` 会使用 MLX。MLX 运行网络，并默认在 GPU 上采样：过滤规则与 torch 相同，但随机数来自 MLX，所以同一 seed 不复现 torch 运行的 token。运行时选项 `mlx_sampler="torch"` 改用 torch CPU 随机数流，与 torch 在 MPS/CPU 上的采样相同（CUDA 用 CUDA 生成器，仍不同）；网络的 BF16 舍入差异仍可能让序列逐渐分叉。FP32 VAE 默认也在 MLX 中解码，分块和裁剪与 torch 相同；噪声仍由 torch CPU 生成，与 torch 路径相同。此时 yue2-infer 不再是固定的 0.1.5，`summary.json` 记录实际 `package_version`、区分源码版本的 `runtime_sha256`、`backend`、`sampler` 和 `vae_backend`；模型文件仍按 release.json 校验哈希。venv、`models/` 和 `work/` 放在 skill 目录之外，否则 `verify_bundle.py --strict` 会因多余文件和 venv 符号链接失败。
+
 本包不携带模型、PyTorch、推理 wheel 或凭据。推理 wheel 来自公开官方仓库，固定 **yue2-infer 0.1.5**；模型的精确 revision、必需文件及哈希写在 `assets/release.json`。默认两个权重文件合计约 7.8 GB；环境依赖另占空间。此文件是唯一版本来源，不用 latest 替换它。
 
 ## 新集群

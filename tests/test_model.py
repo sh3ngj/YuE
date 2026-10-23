@@ -10,6 +10,7 @@ import torch
 from transformers import AutoModelForCausalLM
 from transformers.cache_utils import DynamicCache, StaticCache
 
+from yue2 import modeling_yue2
 from yue2.modeling_yue2 import YuE2Config, YuE2ForCausalLM, StaticKVCache
 
 
@@ -137,6 +138,38 @@ def test_training_labels_and_causality(model):
     assert torch.isfinite(model(first, labels=first).loss)
     with pytest.raises(ValueError, match="Loss"):
         model(first, labels=first, logits_to_keep=1)
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="Apple Silicon MPS is unavailable")
+def test_mps_short_queries_are_padded_past_the_vector_kernel(monkeypatch):
+    # PyTorch 2.10's MPS vector kernel corrupts <= 8-row queries over > 1023 keys, mask or not.
+    seen = []
+    original = modeling_yue2.F.scaled_dot_product_attention
+
+    def record(query, key, value, attn_mask=None, is_causal=False, enable_gqa=False):
+        seen.append((query.shape[-2], None if attn_mask is None else tuple(attn_mask.shape), is_causal))
+        return original(query, key, value, attn_mask=attn_mask, is_causal=is_causal, enable_gqa=enable_gqa)
+
+    monkeypatch.setattr(modeling_yue2.F, "scaled_dot_product_attention", record)
+    key = torch.zeros(1, 2, 1024, 8, device="mps")
+    assert modeling_yue2.sdpa(torch.zeros(1, 4, 1, 8, device="mps"), key, key).shape == (1, 4, 1, 8)
+    mask = torch.ones(3, 1024, dtype=torch.bool, device="mps")
+    assert modeling_yue2.sdpa(torch.zeros(1, 4, 3, 8, device="mps"), key, key, attn_mask=mask).shape == (1, 4, 3, 8)
+    modeling_yue2.sdpa(torch.zeros(1, 4, 3, 8, device="mps"), key[:, :, :3], key[:, :, :3], is_causal=True)
+    modeling_yue2.sdpa(torch.zeros(1, 4, 1, 8), key.cpu(), key.cpu())
+    assert seen == [(9, None, False), (9, (9, 1024), False), (3, None, True), (1, None, False)]
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="Apple Silicon MPS is unavailable")
+def test_mps_short_query_attention_matches_cpu():
+    generator = torch.Generator().manual_seed(17)
+    for rows in range(1, 9):
+        query = torch.randn(1, 16, rows, 128, generator=generator)
+        key, value = (torch.randn(1, 8, 2048, 128, generator=generator) for _ in range(2))
+        expected = modeling_yue2.sdpa(query, key, value)
+        for mask in (None, torch.ones(rows, 2048, dtype=torch.bool, device="mps")):
+            actual = modeling_yue2.sdpa(*(t.to("mps", torch.bfloat16) for t in (query, key, value)), attn_mask=mask)
+            assert (actual.float().cpu() - expected).abs().max() < 0.05 * expected.abs().max(), (rows, mask is None)
 
 
 def test_release_tensor_names_and_shapes_when_source_available():
