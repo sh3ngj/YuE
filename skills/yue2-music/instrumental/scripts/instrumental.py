@@ -293,6 +293,7 @@ def generate(args):
             truncated=receipt['truncated'], exact_prefix_verified=True, exact_abc_verified=True,
             seed=request['seed'], cot=request['cot'], package_version=version,
             device=device, gpu=gpu, backend=backend, sampler=song.timing['semantic'].get('sampler', 'torch_cpu'),
+            vae_backend=getattr(pipe, 'vae_backend', 'torch'),
             runtime_patches=patches, peak=float(np.max(np.abs(song.audio))),
             rms=float(np.sqrt(np.mean(song.audio.astype(np.float64) ** 2))),
             decoder='m-a-p/YuE2-Vae (listening)', weights=receipt['weights'],

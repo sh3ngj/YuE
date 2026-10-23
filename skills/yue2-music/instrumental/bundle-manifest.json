@@ -16,8 +16,8 @@
       "bytes": 3017
     },
     "SKILL.md": {
-      "sha256": "b9ddd7f7ecec3e86d337645f5548dd0d41b3397b637edcf7422832ed8297eacd",
-      "bytes": 4826
+      "sha256": "524bfaae2d3bf83f88f2e8bc009ccf1cf1a0472bb1b665fc5bdfa884539fafb7",
+      "bytes": 4874
     },
     "agents/openai.yaml": {
       "sha256": "e88118d8ff5bfc52ef0344e088bd48621dfcc9b3734e7c7b88043fe663a75720",
@@ -64,8 +64,8 @@
       "bytes": 1780
     },
     "references/setup.md": {
-      "sha256": "a37cbc566a9702a83fa169e11b2010ba1fc00f8d5866d8113c13e5e9c242b8e4",
-      "bytes": 6550
+      "sha256": "6ce84a536f8b877710905638812c8d08b173348ae68ba9bf525db8d750268e02",
+      "bytes": 6668
     },
     "requirements-inference.txt": {
       "sha256": "2f24e5cc62394398504336fabf16b4ae7639376a3fc43c8d32eecc908ded9895",
@@ -84,8 +84,8 @@
       "bytes": 10540
     },
     "scripts/instrumental.py": {
-      "sha256": "b4113d6269400d51f3019854426634f9a4c5092d9e3e24e0ca5ada3b3a59b5de",
-      "bytes": 29989
+      "sha256": "e34cc20301535299381e5da8ce56a5e71fa9f1feaf467602bab0af8736574388",
+      "bytes": 30052
     },
     "scripts/instrumentalize.py": {
       "sha256": "a769111656f418cf4298841dc4a7f6be1a50bfae1e66b1bccfaca3eacf948681",

@@ -4,7 +4,7 @@
 
 Apple Silicon（macOS、MPS）也可运行同一 wheel 和预设，但不属于已验证基线。doctor 要求 MPS 支持 BF16，且 Metal 建议工作集至少 20 GiB。PyTorch 2.10 的 MPS 单 query 注意力在缓存 key 达到 1024 个后输出错误，使逐 token 解码（写谱和语义 token）退化成乱码；脚本在 MPS 上为单 query 注意力加显式全可见 mask（`mps_decode_mask`），与上游运行时修复一致，并写入 `runtime_patches`。
 
-MLX（可选，Apple Silicon 上更快）：固定 wheel 不含 MLX 后端。另建环境，从 YuE 仓库源码安装运行时及其 `[mlx]` extra，例如 `python -m pip install '/path/to/YuE[mlx]'`；MLX 版本固定在 `assets/release.json`。用 `doctor --backend mlx --require-gpu --models-root models` 验证，之后 `run` 的默认 `--backend auto` 会使用 MLX。MLX 运行网络，并默认在 GPU 上采样：过滤规则与 torch 相同，但随机数来自 MLX，所以同一 seed 不复现 torch 运行的 token；需要逐 token 对照官方运行时，用运行时选项 `mlx_sampler="torch"`。噪声和 VAE 与 torch 路径相同。此时 yue2-infer 不再是固定的 0.1.5，`summary.json` 记录实际 `package_version` 和 `backend`；模型文件仍按 release.json 校验哈希。venv、`models/` 和 `work/` 放在 skill 目录之外，否则 `verify_bundle.py --strict` 会因多余文件和 venv 符号链接失败。
+MLX（可选，Apple Silicon 上更快）：固定 wheel 不含 MLX 后端。另建环境，从 YuE 仓库源码安装运行时及其 `[mlx]` extra，例如 `python -m pip install '/path/to/YuE[mlx]'`；MLX 版本固定在 `assets/release.json`。用 `doctor --backend mlx --require-gpu --models-root models` 验证，之后 `run` 的默认 `--backend auto` 会使用 MLX。MLX 运行网络，并默认在 GPU 上采样：过滤规则与 torch 相同，但随机数来自 MLX，所以同一 seed 不复现 torch 运行的 token；需要逐 token 对照官方运行时，用运行时选项 `mlx_sampler="torch"`。FP32 VAE 默认也在 MLX 中解码，分块和裁剪与 torch 相同；噪声仍由 torch CPU 生成，与 torch 路径相同。此时 yue2-infer 不再是固定的 0.1.5，`summary.json` 记录实际 `package_version`、`backend`、`sampler` 和 `vae_backend`；模型文件仍按 release.json 校验哈希。venv、`models/` 和 `work/` 放在 skill 目录之外，否则 `verify_bundle.py --strict` 会因多余文件和 venv 符号链接失败。
 
 本包不携带模型、PyTorch、推理 wheel 或凭据。推理 wheel 来自公开官方仓库，固定 **yue2-infer 0.1.5**；模型的精确 revision、必需文件及哈希写在 `assets/release.json`。默认两个权重文件合计约 7.8 GB；环境依赖另占空间。此文件是唯一版本来源，不用 latest 替换它。
 
