@@ -121,7 +121,8 @@ class SongResult:
 class YuE2Pipeline:
     def __init__(self, model_dir, vae_dir, *, device="auto", memory_budget_gib=24,
                  backend="torch", generation_config=None, verify_hashes=True,
-                 vae_core_frames=None, quantization="none", offload_ar=False, progress=True):
+                 vae_core_frames=None, quantization="none", offload_ar=False, progress=True,
+                 mlx_sampler="device"):
         if not isinstance(progress, bool):
             raise TypeError("progress must be True or False")
         self.progress = progress
@@ -136,6 +137,10 @@ class YuE2Pipeline:
             if quantization != "none" or offload_ar:
                 raise ValueError("The MLX backend runs the unquantized preset in unified memory; "
                                  "fp8 and offload_ar are CUDA options")
+        if mlx_sampler not in {"device", "torch"}:
+            raise ValueError("mlx_sampler must be device or torch")
+        # MLX only: "device" samples in MLX; "torch" keeps the torch RNG's draws.
+        self.mlx_sampler = mlx_sampler
         if not 0 < memory_budget_gib:
             raise ValueError("memory_budget_gib must be positive")
         if device == "auto":
@@ -264,7 +269,8 @@ class YuE2Pipeline:
                 result = generate_vllm(self, prefix, sampling, seed, phase, on_token=observed, **kwargs)
             elif self.backend == "mlx":
                 from .mlx_backend import generate_tokens as generate_mlx
-                result = generate_mlx(model, prefix, sampling, seed, phase, on_token=observed, **kwargs)
+                result = generate_mlx(model, prefix, sampling, seed, phase, on_token=observed,
+                                      sampler=self.mlx_sampler, **kwargs)
             else:
                 result = generate_tokens(model, prefix, sampling, seed, phase,
                                          use_cuda_graph=self.backend != "torch-eager", on_token=observed, **kwargs)
@@ -392,7 +398,7 @@ class YuE2Pipeline:
         overrides = {k: v for k, v in config.items() if defaults.get(k) != v}
         if request.guidance != (1.01 if request.cot == "off" else 1.0):
             overrides["cfg_scale"] = request.guidance
-        return {"generation": config, "overrides": overrides,
+        effective = {"generation": config, "overrides": overrides,
                 "cot": request.cot, "cfg_scale": request.guidance,
                 "cfg_negative": "instruction_only" if request.cot == "off" else "same_instruction_and_exact_abc",
                 "backend": self.backend, "quantization": self.quantization,
@@ -402,6 +408,10 @@ class YuE2Pipeline:
                 "offload_ar": self.offload_ar, "runtime_sha256": self.runtime_sha256,
                 "decoder_release": json.loads((self.vae_dir / "config.json").read_text(encoding="utf-8")).get("release_variant"),
                 "validation_status": "unvalidated"}
+        if self.backend == "mlx":
+            # Historical off sampling always keeps the torch sampler; see mlx_backend.generate_tokens.
+            effective["mlx_sampler"] = "torch" if request.cot == "off" else self.mlx_sampler
+        return effective
 
     def __call__(self, style=None, lyrics=None, *, tags=None, abc_sampling=None,
                  semantic_sampling=None, cancelled=None, on_token=None, **kwargs):

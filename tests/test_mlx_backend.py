@@ -8,7 +8,7 @@ mx = pytest.importorskip("mlx.core")
 from yue2 import mlx_backend, nar  # noqa: E402
 from yue2.modeling_yue2 import YuE2Config, YuE2ForCausalLM  # noqa: E402
 from yue2.protocol import ABC_END, CODEC_OFFSET, EOD, MUSIC_END, VOCAB_SIZE, Sampling  # noqa: E402
-from yue2.sampling import generate_tokens  # noqa: E402
+from yue2.sampling import distribution, generate_tokens  # noqa: E402
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -66,13 +66,86 @@ def test_generated_tokens_match_torch_eager(models, phase, cfg, legacy):
                                                       cfg_scale=cfg, legacy_off=legacy, use_cuda_graph=False)
     seen = []
     actual, timing, truncated = mlx_backend.generate_tokens(model, prefix, sampling, 5, phase, negative=negative,
-                                                            cfg_scale=cfg, legacy_off=legacy,
+                                                            cfg_scale=cfg, legacy_off=legacy, sampler="torch",
                                                             on_token=lambda p, t: seen.append(t))
     assert actual == expected and truncated == expected_truncated
     low, high = (0, EOD) if phase == "abc" else (CODEC_OFFSET, CODEC_OFFSET + 32768)
     assert all(low <= token < high for token in actual) and len(actual) >= sampling.min_tokens
     assert seen[:len(actual)] == actual and timing["cfg_branches"] == (1 if cfg == 1.0 else 2)
     assert timing["backend_actual"] == "mlx" and timing["output_tokens"] == len(seen)
+    assert timing["sampler"] == "torch_cpu"
+
+
+def phase_local(phase, native):
+    return native if phase == "abc" else native - CODEC_OFFSET
+
+
+@pytest.mark.parametrize("phase", ["abc", "semantic"])
+@pytest.mark.parametrize("sampling", [
+    Sampling(temperature=1.0, top_p=0.9, top_k=30, repetition_penalty=1.2, penalty_window=8, min_tokens=6),
+    Sampling(temperature=0.7, top_p=0.95, top_k=100, repetition_penalty=1.005, penalty_window=100, min_tokens=0),
+    Sampling(temperature=1.3, top_p=1.0, top_k=5, repetition_penalty=1.0, penalty_window=1, min_tokens=0),
+    Sampling(temperature=0.0, top_p=0.9, top_k=30, repetition_penalty=1.2, penalty_window=50, min_tokens=0),
+])
+def test_device_filters_match_torch_distribution(phase, sampling):
+    allowed = torch.from_numpy(mlx_backend.PHASE_TOKENS[phase])
+    generator = torch.Generator().manual_seed(11)
+    compact = torch.randn(len(allowed), generator=generator) * 4  # FP32: no ties
+    # Repeats exercise the frequency-powered penalty, the planner's guard against loops.
+    history = [int(allowed[i]) for i in torch.randint(0, 200, (12,), generator=generator)] + [int(allowed[3])] * 3
+    full = torch.full((1, VOCAB_SIZE), float("-inf"))
+    full[0, allowed] = compact
+    device = mlx_backend.DeviceSampler(sampling, phase, seed=1)
+    for step in (0, 7):
+        expected = distribution(full, sampling, history, step, phase)[0, allowed]
+        recent = mx.array([phase_local(phase, t) for t in history[-sampling.penalty_window:]], dtype=mx.int32)
+        actual = as_torch(device.scores(mx.array(compact.numpy()), recent, step))
+        assert torch.equal(torch.isfinite(actual), torch.isfinite(expected))
+        finite = torch.isfinite(expected)
+        torch.testing.assert_close(actual[finite], expected[finite], atol=1e-5, rtol=1e-5)
+
+
+def test_device_draws_follow_the_filtered_distribution():
+    device = mlx_backend.DeviceSampler(Sampling(min_tokens=0), "semantic", seed=3)
+    values = np.full(device.size, -np.inf, dtype=np.float32)
+    values[[4, 9, 20]] = [0.0, 1.0, 2.0]
+    scores = mx.array(values)
+    draws = np.array([device.sample(scores).item() for _ in range(3000)])
+    expected = torch.softmax(torch.tensor([0.0, 1.0, 2.0]), -1).numpy()
+    np.testing.assert_allclose([np.mean(draws == i) for i in (4, 9, 20)], expected, atol=0.03)
+
+
+@pytest.mark.parametrize("cfg", [1.0, 1.5])
+def test_device_generation_is_seeded_and_follows_the_protocol(models, cfg):
+    _, model = models
+    sampling = Sampling(temperature=1.0, top_p=0.9, top_k=30, repetition_penalty=1.2,
+                        penalty_window=8, min_tokens=6, max_tokens=24)
+    negative = [EOD, 21, 22] if cfg != 1.0 else None
+    runs = []
+    for seed in (5, 5, 6):
+        seen = []
+        tokens, timing, truncated = mlx_backend.generate_tokens(model, [EOD, 11, 12], sampling, seed, "semantic",
+                                                                negative=negative, cfg_scale=cfg,
+                                                                on_token=lambda p, t: seen.append(t))
+        assert all(CODEC_OFFSET <= t < CODEC_OFFSET + 32768 for t in tokens) and len(tokens) >= 6
+        assert seen[:len(tokens)] == tokens and timing["output_tokens"] == len(seen)
+        assert timing["sampler"] == "mlx_device" and timing["cfg_branches"] == (1 if cfg == 1.0 else 2)
+        assert truncated == (len(tokens) == sampling.max_tokens and seen[-1] != MUSIC_END)
+        runs.append(tokens)
+    assert runs[0] == runs[1] and runs[0] != runs[2]
+
+
+def test_device_request_for_historical_off_uses_torch_sampling(models):
+    reference, model = models
+    sampling = Sampling(min_tokens=3, max_tokens=12)
+    expected, _, _ = generate_tokens(reference, [EOD, 9], sampling, 2, "semantic", negative=[EOD],
+                                     cfg_scale=1.01, legacy_off=True, use_cuda_graph=False)
+    actual, timing, _ = mlx_backend.generate_tokens(model, [EOD, 9], sampling, 2, "semantic", negative=[EOD],
+                                                    cfg_scale=1.01, legacy_off=True)
+    assert actual == expected and timing["sampler"] == "torch_cpu"
+    assert timing["sampler_fallback_reason"] == "historical_off_sampling_uses_torch"
+    with pytest.raises(ValueError, match="sampler"):
+        mlx_backend.generate_tokens(model, [EOD], sampling, 2, "semantic", sampler="gpu")
 
 
 def test_generation_checks_protocol_limits(models):

@@ -1,9 +1,10 @@
 """Optional Apple Silicon MLX backend for the YuE2 AR–NAR network.
 
-Only the network runs in MLX. Token sampling reuses the eager path's CPU
-arithmetic and torch RNG, and acoustic flow matching reuses the full-song CPU
-noise draw, midpoint schedule and model-dtype state updates. Base imports never
-require MLX; YuE2Pipeline(backend="mlx") imports this module on demand.
+The network runs in MLX. Token sampling applies the eager path's filters either
+in MLX with its own RNG (default) or with the eager path's CPU arithmetic and
+torch RNG. Acoustic flow matching reuses the full-song CPU noise draw, midpoint
+schedule and model-dtype state updates. Base imports never require MLX;
+YuE2Pipeline(backend="mlx") imports this module on demand.
 """
 from __future__ import annotations
 
@@ -203,11 +204,66 @@ class KVCache:
         return self.keys[index][..., :end, :], self.values[index][..., :end, :]
 
 
+class DeviceSampler:
+    """sampling.distribution's filters on phase-local logits in MLX, with a request-local MLX RNG.
+
+    The min-length, windowed repetition penalty, temperature, top-k (ties survive) and
+    shifted top-p rules run in FP32 as in the torch sampler. Tied values at the top-p
+    boundary may sort differently, and draws come from MLX, so a seed does not reproduce
+    the torch sampler's tokens.
+    """
+
+    def __init__(self, sampling, phase, seed):
+        self.sampling = sampling
+        self.size = len(PHASE_TOKENS[phase])
+        self.end = self.size - 1  # Both phases list their end token last.
+        self.positions = mx.arange(self.size)
+        self.key = mx.random.key(seed)
+
+    def scores(self, logits, recent, step):
+        """Filtered FP32 scores; recent holds phase-local IDs of the penalty window, or None."""
+        sampling, blocked = self.sampling, mx.array(float("-inf"))
+        scores = logits.astype(mx.float32)
+        if step < sampling.min_tokens:
+            scores = mx.where(self.positions == self.end, blocked, scores)
+        if sampling.repetition_penalty != 1.0 and recent is not None:
+            frequency = mx.zeros((self.size,), dtype=mx.float32).at[recent].add(1.0)
+            alpha = mx.power(sampling.repetition_penalty, frequency)
+            scores = mx.where(scores < 0, scores * alpha, scores / alpha)
+        if sampling.temperature == 0:
+            return scores
+        if sampling.temperature != 1:
+            scores = scores / sampling.temperature
+        threshold = mx.min(mx.topk(scores, min(sampling.top_k, self.size)))
+        scores = mx.where(scores < threshold, blocked, scores)
+        if sampling.top_p < 1:
+            order = mx.argsort(-scores)
+            values = scores[order]
+            probabilities = mx.softmax(values, precise=True)
+            removed = (mx.cumsum(probabilities) - probabilities > sampling.top_p) & (self.positions >= 1)
+            scores = mx.put_along_axis(scores, order, mx.where(removed, blocked, values), axis=-1)
+        return scores
+
+    def sample(self, scores):
+        if self.sampling.temperature == 0:
+            return mx.argmax(scores)
+        self.key, key = mx.random.split(self.key)
+        return mx.random.categorical(scores, key=key)
+
+
 def generate_tokens(model, prefix, sampling, seed, phase, negative=None, cfg_scale=1.0,
-                    legacy_off=False, cancelled=None, on_token=None):
-    """MLX twin of sampling.generate_tokens with identical checks, sampling and RNG."""
+                    legacy_off=False, cancelled=None, on_token=None, sampler="device"):
+    """MLX twin of sampling.generate_tokens with the same checks, filters and timing record.
+
+    sampler="torch" keeps the eager path's CPU sampling arithmetic and torch RNG, so equal
+    logits give the torch backend's tokens. sampler="device" samples with DeviceSampler and
+    queues each next decode step before reading the current token. Historical off sampling
+    keeps its BF16 torch arithmetic, so it always uses the torch sampler.
+    """
     if phase not in PHASE_TOKENS:
         raise ValueError("phase must be abc or semantic")
+    if sampler not in ("device", "torch"):
+        raise ValueError("sampler must be device or torch")
     if len(prefix) + sampling.max_tokens > CONTEXT:
         raise ValueError("Prefix + requested generation budget exceeds 24576; no implicit truncation")
     if cfg_scale != 1 and negative is None:
@@ -216,58 +272,96 @@ def generate_tokens(model, prefix, sampling, seed, phase, negative=None, cfg_sca
         raise ValueError("Negative prefix + generation budget exceeds context")
     if cancelled is not None and cancelled():
         raise InterruptedError("Cancelled before prefill")
-    # The two stages deliberately reset their request-local seed, matching the preset.
-    generator = torch.Generator(device="cpu").manual_seed(seed)
-    allowed = torch.from_numpy(PHASE_TOKENS[phase])
+    fallback = None
+    if sampler == "device" and legacy_off:
+        sampler, fallback = "torch", "historical_off_sampling_uses_torch"
+    tokens = PHASE_TOKENS[phase]
     # Only allowed rows of lm_head are evaluated; the others would be masked to -inf.
-    head = mx.take(model.lm_head.weight, mx.array(PHASE_TOKENS[phase]), axis=0)
-    # vLLM's symbolic processor receives FP32 logits; historical off uses BF16.
-    score_dtype = TORCH_DTYPES[model.dtype] if legacy_off else torch.float32
+    head = mx.take(model.lm_head.weight, mx.array(tokens), axis=0)
 
     def logits(ids, cache):
-        return model.hidden(mx.array([ids], dtype=mx.int32), cache)[:, -1] @ head.T
+        return (model.hidden(ids, cache)[:, -1] @ head.T)[0]
+
+    def mix(conditional, unconditional=None):
+        # Preserve historical model-dtype CFG subtraction/multiply/add before upcast.
+        return conditional if unconditional is None else unconditional + cfg_scale * (conditional - unconditional)
 
     start = time.perf_counter()
     branches = [KVCache(model, len(prefix) + sampling.max_tokens)]
-    conditional, unconditional = logits(prefix, branches[0]), None
+    prefilled = [logits(mx.array([prefix], dtype=mx.int32), branches[0])]
     if cfg_scale != 1.0:
         branches.append(KVCache(model, len(negative) + sampling.max_tokens))
-        unconditional = logits(negative, branches[1])
-    mx.eval([value for value in (conditional, unconditional) if value is not None])
+        prefilled.append(logits(mx.array([negative], dtype=mx.int32), branches[1]))
+    mx.eval(prefilled)
     prefill_seconds = time.perf_counter() - start
+
+    def decode(ids):
+        return mix(*(logits(ids, cache) for cache in branches))
+
     history, first, eos = [], None, False
     end = ABC_END if phase == "abc" else MUSIC_END
-    for step in range(sampling.max_tokens):
-        if cancelled is not None and cancelled():
-            raise InterruptedError(f"Cancelled during {phase}")
-        # Preserve historical model-dtype CFG subtraction/multiply/add before upcast.
-        mixed = conditional if cfg_scale == 1.0 else unconditional + cfg_scale * (conditional - unconditional)
-        scores = torch.full((1, model.vocab_size), float("-inf"), dtype=score_dtype)
-        scores[0, allowed] = torch.from_numpy(np.array(mixed[0].astype(mx.float32))).to(score_dtype)
-        scores = distribution(scores, sampling, history, step, phase, legacy_off)
-        if sampling.temperature == 0:
-            next_id = scores.argmax(-1, keepdim=True)
-        else:
-            next_id = torch.multinomial(scores.softmax(-1), 1, generator=generator)
-        token = int(next_id.item())
+
+    def accept(token):
+        """Record one sampled native token; True when it ends the phase."""
+        nonlocal first, eos
         if first is None:
             first = time.perf_counter() - start
         if on_token is not None:
             on_token(phase, token)
         if token == end:
             eos = True
-            break
+            return True
         history.append(token)
-        if step + 1 < sampling.max_tokens:
-            conditional = logits([token], branches[0])
-            if len(branches) > 1:
-                unconditional = logits([token], branches[1])
+        return False
+
+    if sampler == "torch":
+        # The two stages deliberately reset their request-local seed, matching the preset.
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+        allowed = torch.from_numpy(tokens)
+        # vLLM's symbolic processor receives FP32 logits; historical off uses BF16.
+        score_dtype = TORCH_DTYPES[model.dtype] if legacy_off else torch.float32
+        current = mix(*prefilled)
+        for step in range(sampling.max_tokens):
+            if cancelled is not None and cancelled():
+                raise InterruptedError(f"Cancelled during {phase}")
+            scores = torch.full((1, model.vocab_size), float("-inf"), dtype=score_dtype)
+            scores[0, allowed] = torch.from_numpy(np.array(current.astype(mx.float32))).to(score_dtype)
+            scores = distribution(scores, sampling, history, step, phase, legacy_off)
+            if sampling.temperature == 0:
+                next_id = scores.argmax(-1, keepdim=True)
+            else:
+                next_id = torch.multinomial(scores.softmax(-1), 1, generator=generator)
+            if accept(int(next_id.item())):
+                break
+            if step + 1 < sampling.max_tokens:
+                current = decode(mx.array([[history[-1]]], dtype=mx.int32))
+    else:
+        device = DeviceSampler(sampling, phase, seed)
+        native, recent = mx.array(tokens, dtype=mx.int32), None
+        token = device.sample(device.scores(mix(*prefilled), recent, 0))
+        mx.async_eval(token)
+        for step in range(sampling.max_tokens):
+            if cancelled is not None and cancelled():
+                raise InterruptedError(f"Cancelled during {phase}")
+            following = None
+            if step + 1 < sampling.max_tokens:
+                # Queue the next step before reading this token; an end token wastes that one step.
+                recent = token[None] if recent is None else mx.concatenate([recent, token[None]])
+                recent = recent[-sampling.penalty_window:]
+                following = device.sample(device.scores(decode(native[token].reshape(1, 1)), recent, step + 1))
+                mx.async_eval(following)
+            if accept(int(tokens[token.item()])):
+                break
+            token = following
     seconds = time.perf_counter() - start
     count = len(history) + int(eos)
     timing = {"seconds": seconds, "prefill_seconds": prefill_seconds, "ttft_seconds": first,
               "output_tokens": count, "content_tokens": len(history), "output_tps": count / seconds,
               "prefix_tokens": len(prefix), "cfg_branches": len(branches), "execution": "mlx",
-              "attention": "mlx_fast_sdpa", "backend_actual": "mlx", "mlx_version": mx.__version__}
+              "attention": "mlx_fast_sdpa", "backend_actual": "mlx", "mlx_version": mx.__version__,
+              "sampler": "mlx_device" if sampler == "device" else "torch_cpu"}
+    if fallback:
+        timing["sampler_fallback_reason"] = fallback
     return history, timing, not eos
 
 
