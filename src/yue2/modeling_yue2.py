@@ -27,7 +27,8 @@ def mps_safe_attention(query, key, value, *, attn_mask=None, is_causal=False, en
     stores FP32 partial sums in BF16/FP16-sized scratch buffers, corrupting results
     and nearby memory nondeterministically, with or without a mask
     (pytorch/pytorch#174945). Padding the queries to 9 rows selects the regular
-    kernel; the extra rows are discarded.
+    kernel; the extra rows are discarded. Padding at every key length avoids
+    depending on the kernel's exact threshold; it slows MPS decoding by 5-7%.
     """
     rows = query.shape[-2]
     if query.device.type != "mps" or rows > MPS_VECTOR_QUERIES or is_causal:

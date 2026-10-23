@@ -1,7 +1,8 @@
 """Memory-bounded acoustic flow matching with one AR prefill per original chunk.
 
-Only PyTorch is required. The reference 32-step midpoint solver, full-song CPU
-FP32 noise draw, boundary positions, and original context chunks are preserved.
+Only PyTorch and the model module are required. The reference 32-step midpoint
+solver, full-song CPU FP32 noise draw, boundary positions, and original context
+chunks are preserved.
 Attention query tiling changes temporary storage, never the visible key set.
 """
 from __future__ import annotations

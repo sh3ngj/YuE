@@ -9,10 +9,16 @@ import torch
 import torch.nn.functional as F
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "skills/yue2-music/instrumental/scripts"
-with patch.object(sys, "path", [str(SCRIPTS), *sys.path]):
+# The strict bundle check rejects unlisted files, so loading the skill must not write bytecode
+# into it; its helper modules are dropped afterwards so they cannot shadow the parent skill's.
+_loaded = set(sys.modules)
+with patch.object(sys, "path", [str(SCRIPTS), *sys.path]), patch.object(sys, "dont_write_bytecode", True):
     SPEC = importlib.util.spec_from_file_location("skill_instrumental", SCRIPTS / "instrumental.py")
     INSTRUMENTAL = importlib.util.module_from_spec(SPEC)
     SPEC.loader.exec_module(INSTRUMENTAL)
+for _name in set(sys.modules) - _loaded:
+    if Path(getattr(sys.modules[_name], "__file__", None) or "").parent == SCRIPTS:
+        del sys.modules[_name]
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="Apple Silicon MPS is unavailable")
