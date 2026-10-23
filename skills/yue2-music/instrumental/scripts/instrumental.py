@@ -178,29 +178,41 @@ def write_player(out, request, summary, audio_name, shared=False):
     (out / 'index.html').write_text(content, encoding='utf-8')
 
 
-def patch_mps_decode_attention():
-    """Give the pinned runtime the upstream MPS decode fix.
+def patch_mps_short_query_attention():
+    """Give the pinned runtime the upstream fix for short MPS attention queries.
 
-    PyTorch 2.10's maskless MPS kernel for one decode query returns wrong outputs once
-    1024 or more keys are cached; an explicit all-visible mask selects a correct kernel.
+    For at most 8 query rows and more than 1023 keys, PyTorch 2.10's MPS kernel stores
+    FP32 partial sums in BF16/FP16-sized scratch buffers, corrupting results and nearby
+    memory with or without a mask (pytorch/pytorch#174945). This hits single-token
+    decoding and a final 1-8-row flow-matching query block. As in the runtime's
+    mps_safe_attention, short queries are padded to 9 rows and the extra rows discarded.
     """
     import torch
-    from yue2 import modeling_yue2
-    original = modeling_yue2.sdpa
-    if getattr(original, 'mps_decode_mask', False):
+    import torch.nn.functional as F
+    original = F.scaled_dot_product_attention
+    if getattr(original, 'mps_short_query_padding', False):
         return
 
-    def sdpa(query, key, value, *, attn_mask=None, is_causal=False):
-        if attn_mask is None and not is_causal and query.shape[2] == 1:
-            attn_mask = torch.ones(1, 1, 1, key.shape[2], dtype=torch.bool, device=query.device)
-        return original(query, key, value, attn_mask=attn_mask, is_causal=is_causal)
+    def attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False):
+        rows = query.shape[-2]
+        if query.device.type != 'mps' or rows > 8 or is_causal:
+            return original(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal,
+                            scale=scale, enable_gqa=enable_gqa)
+        pad = 9 - rows
+        query = F.pad(query, (0, 0, 0, pad))
+        if attn_mask is not None and attn_mask.ndim >= 2 and attn_mask.shape[-2] == rows > 1:
+            visible = torch.ones_like if attn_mask.dtype == torch.bool else torch.zeros_like
+            filler = visible(attn_mask[..., :1, :]).expand(*attn_mask.shape[:-2], pad, attn_mask.shape[-1])
+            attn_mask = torch.cat([attn_mask, filler], dim=-2)
+        return original(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, scale=scale,
+                        enable_gqa=enable_gqa)[..., :rows, :]
 
-    sdpa.mps_decode_mask = True
-    modeling_yue2.sdpa = sdpa
+    attention.mps_short_query_padding = True
+    F.scaled_dot_product_attention = attention
 
 
 def runtime_patches(pipe):
-    return ['mps_decode_mask'] if pipe.device.type == 'mps' and pipe.backend == 'torch' else []
+    return ['mps_short_query_attention'] if pipe.device.type == 'mps' and pipe.backend == 'torch' else []
 
 
 def open_pipeline(args):
@@ -222,12 +234,12 @@ def open_pipeline(args):
         if torch.cuda.get_device_capability(device)[0] < 8:
             raise RuntimeError('This recipe requires a BF16-capable GPU (compute capability >= 8)')
     elif device.type == 'mps':
-        # Apple Silicon runs the same BF16 AR/NAR and FP32 VAE preset outside the supported CUDA baseline;
-        # with MLX only the network moves to MLX and the VAE stays on MPS.
+        # Apple Silicon runs the same BF16 AR/NAR and FP32 VAE preset outside the supported CUDA baseline,
+        # either in torch on MPS or, with the MLX backend, as MLX network, sampling and VAE.
         if not torch.backends.mps.is_available() or not mps_bf16():
             raise RuntimeError('Apple Silicon MPS with BF16 support is unavailable in this PyTorch build')
         if backend == 'torch':
-            patch_mps_decode_attention()
+            patch_mps_short_query_attention()
     else:
         raise ValueError('This recipe requires a BF16-capable NVIDIA GPU or Apple Silicon MPS')
     model_spec, vae_spec = release['models']['YuE2-3B'], release['models']['YuE2-Vae']
@@ -278,7 +290,9 @@ def generate(args):
                 raise ValueError('ABC exceeds the normal 4096-token planning budget; compact notation without dropping music')
             expected_prefix = token_prefixes(req, pipe.tokenizer)
             device, gpu, backend = str(pipe.device), device_name(pipe.device), pipe.backend
-            patches = runtime_patches(pipe)
+            patches, runtime_sha256 = runtime_patches(pipe), pipe.runtime_sha256
+            # The torch sampler draws from a CUDA generator on CUDA and a CPU generator elsewhere.
+            torch_sampler = 'torch_cuda' if pipe.device.type == 'cuda' else 'torch_cpu'
             song = pipe(**request)
             song.save_artifacts(out / 'native')
         receipt = verify_result(out / 'native')
@@ -291,8 +305,8 @@ def generate(args):
         status = 'needs_review' if any(receipt['truncated'].values()) else 'complete'
         summary = dict(status=status, audio_seconds=receipt['audio_seconds'], sample_rate=48000,
             truncated=receipt['truncated'], exact_prefix_verified=True, exact_abc_verified=True,
-            seed=request['seed'], cot=request['cot'], package_version=version,
-            device=device, gpu=gpu, backend=backend, sampler=song.timing['semantic'].get('sampler', 'torch_cpu'),
+            seed=request['seed'], cot=request['cot'], package_version=version, runtime_sha256=runtime_sha256,
+            device=device, gpu=gpu, backend=backend, sampler=song.timing['semantic'].get('sampler', torch_sampler),
             vae_backend=getattr(pipe, 'vae_backend', 'torch'),
             runtime_patches=patches, peak=float(np.max(np.abs(song.audio))),
             rms=float(np.sqrt(np.mean(song.audio.astype(np.float64) ** 2))),

@@ -64,8 +64,8 @@
       "bytes": 1780
     },
     "references/setup.md": {
-      "sha256": "a089f7b975f30b3acb03713cf13c11a02ecda938636a449221273bff6581548e",
-      "bytes": 6898
+      "sha256": "7bd8dd6524a11a187aa9f025ec5994bb58b6e070db4b84bb1b26abba67c1f20c",
+      "bytes": 7343
     },
     "requirements-inference.txt": {
       "sha256": "2f24e5cc62394398504336fabf16b4ae7639376a3fc43c8d32eecc908ded9895",
@@ -84,8 +84,8 @@
       "bytes": 10540
     },
     "scripts/instrumental.py": {
-      "sha256": "e34cc20301535299381e5da8ce56a5e71fa9f1feaf467602bab0af8736574388",
-      "bytes": 30052
+      "sha256": "525859d704112842cc20f9c8afed7ae6ddeaf3ceb75e0f44be495aa57f1187f3",
+      "bytes": 31318
     },
     "scripts/instrumentalize.py": {
       "sha256": "a769111656f418cf4298841dc4a7f6be1a50bfae1e66b1bccfaca3eacf948681",
