@@ -14,6 +14,7 @@ from typing import Callable, Sequence
 import torch
 import torch.nn.functional as F
 
+from .modeling_yue2 import mps_safe_attention
 from .protocol import CODEC_OFFSET, CODEC_SIZE, CONTEXT, MUSIC_END, chunk_ranges
 
 
@@ -92,7 +93,8 @@ def attention(q, k, v, *, causal=False, backend="sdpa", query_chunk_size=None):
             if causal and start:
                 mask = (torch.arange(end, device=q.device)[None, :] <=
                         torch.arange(start, end, device=q.device)[:, None])
-            outputs.append(F.scaled_dot_product_attention(
+            # A final block of at most 8 rows needs the MPS workaround in mps_safe_attention.
+            outputs.append(mps_safe_attention(
                 query[..., start:end, :], used_key, used_value,
                 attn_mask=mask, is_causal=causal and start == 0, enable_gqa=grouped,
             ))

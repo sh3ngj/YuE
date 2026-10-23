@@ -17,13 +17,34 @@ from transformers.cache_utils import DynamicCache
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
+MPS_VECTOR_QUERIES = 8
+
+
+def mps_safe_attention(query, key, value, *, attn_mask=None, is_causal=False, enable_gqa=False):
+    """F.scaled_dot_product_attention, keeping MPS queries off the two-pass vector kernel.
+
+    For at most 8 query rows and more than 1023 keys, PyTorch 2.10's MPS kernel
+    stores FP32 partial sums in BF16/FP16-sized scratch buffers, corrupting results
+    and nearby memory nondeterministically, with or without a mask
+    (pytorch/pytorch#174945). Padding the queries to 9 rows selects the regular
+    kernel; the extra rows are discarded.
+    """
+    rows = query.shape[-2]
+    if query.device.type != "mps" or rows > MPS_VECTOR_QUERIES or is_causal:
+        return F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask,
+                                              is_causal=is_causal, enable_gqa=enable_gqa)
+    pad = MPS_VECTOR_QUERIES + 1 - rows
+    query = F.pad(query, (0, 0, 0, pad))
+    if attn_mask is not None and attn_mask.ndim >= 2 and attn_mask.shape[-2] == rows > 1:
+        visible = torch.ones_like if attn_mask.dtype == torch.bool else torch.zeros_like
+        filler = visible(attn_mask[..., :1, :]).expand(*attn_mask.shape[:-2], pad, attn_mask.shape[-1])
+        attn_mask = torch.cat([attn_mask, filler], dim=-2)
+    return F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask,
+                                          enable_gqa=enable_gqa)[..., :rows, :]
+
+
 def sdpa(query, key, value, *, attn_mask=None, is_causal=False):
     """Use native grouped-query attention, including a portable MPS fallback."""
-    if query.device.type == "mps" and attn_mask is None and not is_causal and query.shape[2] == 1:
-        # PyTorch 2.10's maskless MPS kernel for one decode query returns wrong
-        # outputs once 1024 or more keys are cached; an explicit all-visible
-        # mask selects a correct kernel.
-        attn_mask = torch.ones(1, 1, 1, key.shape[2], dtype=torch.bool, device=query.device)
     grouped = query.shape[1] != key.shape[1]
     if grouped and query.device.type == "mps":
         # PyTorch's MPS attention does not implement enable_gqa on every release.
@@ -31,10 +52,8 @@ def sdpa(query, key, value, *, attn_mask=None, is_causal=False):
         key = key.repeat_interleave(groups, dim=1)
         value = value.repeat_interleave(groups, dim=1)
         grouped = False
-    return F.scaled_dot_product_attention(
-        query, key, value, attn_mask=attn_mask, is_causal=is_causal,
-        enable_gqa=grouped,
-    )
+    return mps_safe_attention(query, key, value, attn_mask=attn_mask, is_causal=is_causal,
+                              enable_gqa=grouped)
 
 
 def _causal_mask(attention_mask, cache_position, key_length, batch_size):
