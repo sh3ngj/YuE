@@ -292,7 +292,8 @@ def generate(args):
         summary = dict(status=status, audio_seconds=receipt['audio_seconds'], sample_rate=48000,
             truncated=receipt['truncated'], exact_prefix_verified=True, exact_abc_verified=True,
             seed=request['seed'], cot=request['cot'], package_version=version,
-            device=device, gpu=gpu, backend=backend, runtime_patches=patches, peak=float(np.max(np.abs(song.audio))),
+            device=device, gpu=gpu, backend=backend, sampler=song.timing['semantic'].get('sampler', 'torch_cpu'),
+            runtime_patches=patches, peak=float(np.max(np.abs(song.audio))),
             rms=float(np.sqrt(np.mean(song.audio.astype(np.float64) ** 2))),
             decoder='m-a-p/YuE2-Vae (listening)', weights=receipt['weights'],
             audio_adherence_checked=False, absence_of_vocals_checked=False)
