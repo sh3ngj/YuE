@@ -136,7 +136,8 @@ class YuE2Pipeline:
         if "mlx" in {backend, vae_backend}:
             import importlib.util
             if importlib.util.find_spec("mlx") is None:
-                raise ImportError("Install the optional Apple Silicon backend with pip install 'yue2-infer[mlx]'")
+                raise ImportError("The MLX backend needs this runtime's [mlx] extra; from the YuE source tree, "
+                                  "run uv pip install '.[mlx]'")
         if backend == "mlx" and (quantization != "none" or offload_ar):
             raise ValueError("The MLX backend runs the unquantized preset in unified memory; "
                              "fp8 and offload_ar are CUDA options")

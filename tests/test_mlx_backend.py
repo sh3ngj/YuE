@@ -76,6 +76,19 @@ def test_generated_tokens_match_torch_eager(models, phase, cfg, legacy):
     assert timing["sampler"] == "torch_cpu"
 
 
+@pytest.mark.parametrize("phase,cfg", [("abc", 1.0), ("semantic", 1.0), ("semantic", 1.5)])
+def test_greedy_device_tokens_match_torch_eager(models, phase, cfg):
+    reference, model = models
+    sampling = Sampling(temperature=0.0, top_p=0.9, top_k=30, repetition_penalty=1.2,
+                        penalty_window=8, min_tokens=6, max_tokens=24)
+    negative = [EOD, 21, 22] if cfg != 1.0 else None
+    expected, _, _ = generate_tokens(reference, [EOD, 11, 12, 13, 14], sampling, 5, phase, negative=negative,
+                                     cfg_scale=cfg, use_cuda_graph=False)
+    actual, timing, _ = mlx_backend.generate_tokens(model, [EOD, 11, 12, 13, 14], sampling, 5, phase,
+                                                    negative=negative, cfg_scale=cfg)
+    assert actual == expected and timing["sampler"] == "mlx_device"
+
+
 def phase_local(phase, native):
     return native if phase == "abc" else native - CODEC_OFFSET
 

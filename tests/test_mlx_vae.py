@@ -8,7 +8,7 @@ from safetensors.torch import save_file
 
 mx = pytest.importorskip("mlx.core")
 
-from yue2.mlx_vae import MLXVAEDecoder  # noqa: E402
+from yue2.mlx_vae import MLXVAEDecoder, Upsample  # noqa: E402
 from yue2.modeling_vae import YuE2VAE, YuE2VAEConfig  # noqa: E402
 from yue2.pipeline import YuE2Pipeline  # noqa: E402
 
@@ -69,6 +69,25 @@ def test_tiled_decode_matches_torch_tiles_and_halo_rules(models, frames, core):
     assert decoder.required_halo(core) == reference.required_halo(core)
     with pytest.raises(ValueError, match="halo_frames"):
         decoder.decode_tiled(latent[0].T.numpy(), core_frames=core, halo_frames=decoder.required_halo(core) - 1)
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="No Metal GPU")
+def test_polyphase_upsampling_keeps_fp32_on_the_gpu():
+    # MLX's GPU conv_transpose1d computes FP32 at TF32-like precision; the polyphase form must not.
+    rng = np.random.default_rng(0)
+    inputs, outputs, stride = 256, 128, 5
+    weight = rng.standard_normal((inputs, outputs, 2 * stride)).astype(np.float32)
+    bias = rng.standard_normal(outputs).astype(np.float32)
+    norm = np.linalg.norm(weight.reshape(inputs, -1), axis=1).reshape(inputs, 1, 1).astype(np.float32)
+    layer = Upsample({"up.weight_v": weight, "up.weight_g": norm, "up.bias": bias}, "up", stride)
+    x = rng.standard_normal((1, 2000, inputs)).astype(np.float32)
+    with mx.stream(mx.gpu):
+        actual = np.array(layer(mx.array(x)))
+    expected = torch.nn.functional.conv_transpose1d(
+        torch.from_numpy(x).double().transpose(1, 2), torch.from_numpy(weight).double(),
+        torch.from_numpy(bias).double(), stride=stride, padding=-(-stride // 2)).transpose(1, 2).numpy()
+    assert actual.shape == expected.shape
+    assert np.abs(actual - expected).max() < 1e-5 * np.abs(expected).max()
 
 
 def test_checkpoint_validation(models, tmp_path):
