@@ -33,6 +33,7 @@ def get_pipe(args):
              vae_revision=args.vae_revision, device=args.device, memory_budget_gib=args.budget,
              backend=args.backend, quantization=args.quantization, offload_ar=args.offload_ar,
              local_files_only=args.offline, generation_config=config, mlx_sampler=args.mlx_sampler,
+             vae_backend=args.vae_backend,
              vae_core_frames=512 if args.budget <= 12 else 1024,
              progress=not getattr(args, "quiet", False))
 
@@ -201,6 +202,8 @@ def parser():
         q.add_argument("--backend", choices=("torch", "torch-eager", "vllm", "mlx"), default="torch")
         q.add_argument("--mlx-sampler", choices=("device", "torch"), default="device",
                        help="MLX only: sample in MLX, or keep the torch RNG's draws")
+        q.add_argument("--vae-backend", choices=("torch", "mlx"),
+                       help="Audio decoder; defaults to mlx with --backend mlx, otherwise torch")
         q.add_argument("--quantization", choices=("none", "fp8"), default="none")
         q.add_argument("--offload-ar", action="store_true")
         q.add_argument("--offline", action="store_true")

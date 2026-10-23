@@ -139,7 +139,7 @@ with YuE2Pipeline.from_pretrained("m-a-p/YuE2-3B", device="cuda") as pipe:
 | `cot="off"` | Generate directly from lyrics and style |
 | `abc=...` | Supply your own score in `full` or `melody` mode |
 
-**Apple Silicon.** Install `python -m pip install '.[mlx]'` and pass `backend="mlx"` (CLI: `--backend mlx`). The network and token sampling run in MLX with the same BF16 preset and sampling filters; acoustic noise and the VAE decoder are unchanged. MLX draws its own random numbers, so a seed gives a different (but repeatable) song than the torch backend; pass `mlx_sampler="torch"` (`--mlx-sampler torch`) to keep the torch draws. This backend is outside the validated CUDA baseline. On an M5 Pro, a 96-second song took 66 seconds end to end.
+**Apple Silicon.** Install `python -m pip install '.[mlx]'` and pass `backend="mlx"` (CLI: `--backend mlx`). The network, token sampling, and the FP32 VAE decoder run in MLX with the same preset, sampling filters, and decoder tiles; acoustic noise is unchanged. Pass `vae_backend="torch"` (`--vae-backend torch`) to decode with PyTorch. MLX draws its own random numbers, so a seed gives a different (but repeatable) song than the torch backend; pass `mlx_sampler="torch"` (`--mlx-sampler torch`) to keep the torch draws. This backend is outside the validated CUDA baseline. On an M5 Pro, a 96-second song took 62 seconds end to end.
 
 [Generation guide](docs/generation.md) · [Original example inputs](examples/README.md) · [v0.1.6 wheel archive](https://github.com/multimodal-art-projection/YuE/releases/download/yue2-v0.1.6/yue2_infer-0.1.6-py3-none-any.whl)
 
